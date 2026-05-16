@@ -14,6 +14,8 @@ import contextvars
 import json
 import logging
 import os
+import threading
+import time
 import shutil
 import subprocess
 import sys
@@ -40,6 +42,199 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+_JSONL_WRITE_LOCK = threading.Lock()
+_FEISHU_PLATFORM_NAME = "feishu"
+_FEISHU_DELIVERY_LOG = "feishu-delivery-log.jsonl"
+_FEISHU_ALERT_LOG = "feishu-alerts.jsonl"
+_FEISHU_CONSECUTIVE_FAILURE_THRESHOLD = 2
+
+
+def _hermes_evidence_dir() -> Path:
+    """Return ~/.hermes/evidence for ops-watcher artifacts."""
+    return _get_hermes_home() / "evidence" / "ops-watcher"
+
+
+def _hermes_cron_manifests_dir() -> Path:
+    """Return ~/.hermes/cron/manifests."""
+    return _get_hermes_home() / "cron" / "manifests"
+
+
+def _safe_stable_slug(value: str, fallback: str = "job", max_len: int = 64) -> str:
+    """Return a filesystem-safe slug for filenames."""
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in (value or "").strip())
+    safe = safe.strip("-_")
+    if not safe:
+        safe = fallback
+    if len(safe) > max_len:
+        safe = safe[:max_len]
+    return safe
+
+
+def _append_jsonl(log_path: Path, payload: dict) -> bool:
+    """Append one JSONL record. Return False only on write failure."""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with _JSONL_WRITE_LOCK:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        return True
+    except Exception as exc:
+        logger.debug("Failed to write JSONL record to %s: %s", log_path, exc)
+        return False
+
+
+def _read_jsonl_tail(log_path: Path, limit: int = 200) -> list[dict]:
+    """Read the newest ``limit`` JSON objects from a JSONL file."""
+    if not log_path.exists():
+        return []
+
+    records: list[dict] = []
+    try:
+        with log_path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                text = raw.strip()
+                if not text:
+                    continue
+                try:
+                    record = json.loads(text)
+                except Exception:
+                    continue
+                records.append(record)
+                if len(records) > limit:
+                    records.pop(0)
+        return records
+    except Exception as exc:
+        logger.debug("Failed to read JSONL log %s: %s", log_path, exc)
+        return []
+
+
+def _recent_consecutive_failures(records: list[dict], channel: str) -> int:
+    """Count latest consecutive fail/timeout entries for a channel."""
+    failures = 0
+    for record in reversed(records):
+        if record.get("channel") != channel:
+            continue
+        result = str(record.get("result", "")).lower()
+        if result in {"fail", "timeout"}:
+            failures += 1
+            if failures >= _FEISHU_CONSECUTIVE_FAILURE_THRESHOLD:
+                return failures
+            continue
+        break
+    return failures
+
+
+def _classify_error_type(error: Optional[str], *, explicit: str = "") -> str:
+    """Classify an error into a coarse type for manifest bucketing."""
+    if explicit:
+        return explicit
+    text = (error or "").lower()
+    if not text:
+        return "unknown"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "auth" in text or "api key" in text or "api-key" in text:
+        return "auth"
+    if "rate limit" in text or "429" in text or "too many requests" in text:
+        return "rate_limit"
+    if "permission" in text or "forbidden" in text or "access denied" in text:
+        return "permission"
+    if "network" in text or "connect" in text or "dns" in text:
+        return "network"
+    return "runtime"
+
+
+def _derive_exit_code(success: bool, error_type: str) -> int:
+    if success:
+        return 0
+    if error_type == "timeout":
+        return 124
+    return 1
+
+
+def _record_feishu_delivery(
+    job: dict,
+    platform: str,
+    chat_id: str,
+    result: str,
+    latency_ms: int,
+    error: Optional[str],
+) -> None:
+    """Write structured Feishu delivery record and alert if needed."""
+    if platform.lower() != _FEISHU_PLATFORM_NAME:
+        return
+
+    ts = _hermes_now().isoformat()
+    channel = f"{platform}:{chat_id}"
+    record = {
+        "ts": ts,
+        "channel": channel,
+        "result": result,
+        "latency_ms": latency_ms,
+        "job_id": job.get("id"),
+        "chat_id": chat_id,
+        "error": error,
+    }
+    log_path = _hermes_evidence_dir() / _FEISHU_DELIVERY_LOG
+    if not _append_jsonl(log_path, record):
+        return
+
+    if result in {"fail", "timeout"}:
+        history = _read_jsonl_tail(log_path, limit=120)
+        failures = _recent_consecutive_failures(history, channel)
+        if failures >= _FEISHU_CONSECUTIVE_FAILURE_THRESHOLD:
+            alert = {
+                "ts": ts,
+                "severity": "P1",
+                "channel": channel,
+                "job_id": job.get("id"),
+                "consecutive_failures": failures,
+                "result": result,
+                "error": error[:200] if error else "",
+                "summary": "Feishu delivery failed consecutively",
+            }
+            _append_jsonl(_hermes_evidence_dir() / _FEISHU_ALERT_LOG, alert)
+
+
+def _write_cron_manifest(
+    job: dict,
+    run_id: str,
+    run_at: str,
+    status: str,
+    exit_code: int,
+    duration_ms: int,
+    error_type: str,
+    error_message: Optional[str],
+    *,
+    output_file: Optional[Path],
+    delivery_error: Optional[str],
+) -> None:
+    """Write per-run structured manifest to ~/.hermes/cron/manifests."""
+    try:
+        manifests_dir = _hermes_cron_manifests_dir()
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = _safe_stable_slug(job.get("name") or job.get("id") or "cron-job")
+        manifest_path = manifests_dir / f"{safe_name}-{run_id}.json"
+        payload = {
+            "job": job.get("name") or job.get("id") or "",
+            "run_id": run_id,
+            "run_at": run_at,
+            "status": status,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "error_type": error_type,
+            "error_message": error_message,
+            "job_id": job.get("id"),
+            "output_file": str(output_file) if output_file else None,
+            "delivery_error": delivery_error,
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+            handle.write("\n")
+    except Exception as exc:
+        logger.debug("Failed to write cron run manifest: %s", exc)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -548,6 +743,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        delivery_status = "fail"
+        delivery_error = None
+        delivery_started = time.perf_counter()
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -584,7 +782,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
-        delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
@@ -611,6 +808,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                                 job["id"], platform_name, chat_id, err,
                             )
+                            delivery_status = "fail"
+                            delivery_error = err
                             adapter_ok = False  # fall through to standalone path
 
                 # Send extracted media files as native attachments via the live adapter
@@ -627,16 +826,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
-                    delivered = True
+                    delivery_status = "success"
             except Exception as e:
+                delivery_status = "timeout" if isinstance(e, TimeoutError) else "fail"
+                delivery_error = str(e)
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
                     job["id"], platform_name, chat_id, e,
                 )
+                # Keep final delivery_status = fail/timeout and continue
+                # to standalone fallback below.
 
-        if not delivered:
+        if delivery_status != "success":
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            result = None
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -648,19 +852,51 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                     result = future.result(timeout=30)
+                if not isinstance(result, dict):
+                    logger.warning(
+                        "Job '%s': standalone send to %s:%s returned non-dict response: %r",
+                        job["id"], platform_name, chat_id, result,
+                    )
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
+                delivery_status = "timeout" if isinstance(e, TimeoutError) else "fail"
+                delivery_error = str(e)
+                result = None
 
-            if result and result.get("error"):
+            if isinstance(result, dict) and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
+                delivery_status = "fail"
+                delivery_error = str(result["error"])
+            elif isinstance(result, dict) and not result.get("error"):
+                delivery_status = "success"
+            elif result is None and delivery_status != "success":
+                delivery_status = "fail"
+                if not delivery_error:
+                    delivery_error = "standalone send returned no result"
 
-            logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            if delivery_status == "success":
+                logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            else:
+                logger.error("Job '%s': failed delivering to %s:%s (%s)", job["id"], platform_name, chat_id, delivery_status)
+
+        if delivery_status != "success" and not delivery_error:
+            delivery_error = "unknown delivery error"
+            msg = f"delivery to {platform_name}:{chat_id} failed: {delivery_error}"
+            delivery_errors.append(msg)
+        elif delivery_status != "success":
+            msg = f"delivery to {platform_name}:{chat_id} failed: {delivery_error}"
+            delivery_errors.append(msg)
+
+        _record_feishu_delivery(
+            job,
+            platform_name,
+            str(chat_id),
+            delivery_status,
+            int((time.perf_counter() - delivery_started) * 1000),
+            delivery_error,
+        )
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -1742,8 +1978,20 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            run_started = _hermes_now()
+            run_start_monotonic = time.perf_counter()
+            run_error_type = "runtime"
+            output_file = None
+            output = ""
+            final_response = ""
+            error = None
+            delivery_error = None
+            was_success = False
+
             try:
                 success, output, final_response, error = run_job(job)
+                was_success = bool(success)
+                run_error_type = _classify_error_type(error)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -1772,14 +2020,53 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if success and not final_response:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                    run_error_type = _classify_error_type(error)
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                try:
+                    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                except Exception as e:
+                    run_error_type = _classify_error_type(f"{type(e).__name__}: {e}")
+                    was_success = False
+                    error = f"Failed to persist job run state: {e}"
+                    logger.error("mark_job_run failed for job %s: %s", job["id"], e)
+                    return False
+                was_success = bool(success)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                was_success = False
+                error = str(e)
+                run_error_type = _classify_error_type(error)
+                if delivery_error is None:
+                    delivery_error = str(e)
+                try:
+                    mark_job_run(job["id"], False, str(e))
+                except Exception as mark_exc:
+                    logger.error("mark_job_run failed for job %s: %s", job['id'], mark_exc)
+                    run_error_type = _classify_error_type(
+                        f"{type(mark_exc).__name__}: {mark_exc}",
+                        explicit="runtime",
+                    )
                 return False
+            finally:
+                run_at = run_started.isoformat()
+                duration_ms = int((time.perf_counter() - run_start_monotonic) * 1000)
+                status = "success" if was_success else (
+                    "timeout" if run_error_type == "timeout" else "fail"
+                )
+                _write_cron_manifest(
+                    job=job,
+                    run_id=run_started.strftime("%Y%m%d_%H%M%S_%f"),
+                    run_at=run_at,
+                    status=status,
+                    exit_code=_derive_exit_code(was_success, run_error_type),
+                    duration_ms=duration_ms,
+                    error_type=run_error_type if not was_success else "",
+                    error_message=error,
+                    output_file=output_file,
+                    delivery_error=delivery_error,
+                )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —

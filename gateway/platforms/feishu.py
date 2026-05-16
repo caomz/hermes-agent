@@ -1768,10 +1768,12 @@ class FeishuAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
+        last_msg_type = "unknown"
 
         try:
             for chunk in chunks:
                 msg_type, payload = self._build_outbound_payload(chunk)
+                last_msg_type = msg_type
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1806,9 +1808,33 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            if result.success:
+                logger.info(
+                    "[Feishu] send_result success=true chat_id=%s message_id=%s chunks=%d msg_type=%s ack=message_id",
+                    chat_id,
+                    result.message_id or "",
+                    len(chunks),
+                    last_msg_type,
+                )
+            else:
+                logger.warning(
+                    "[Feishu] send_result success=false chat_id=%s chunks=%d msg_type=%s error=%s",
+                    chat_id,
+                    len(chunks),
+                    last_msg_type,
+                    result.error or "unknown",
+                )
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
+            logger.warning(
+                "[Feishu] send_result success=false chat_id=%s chunks=%d msg_type=%s error=%s",
+                chat_id,
+                len(chunks),
+                last_msg_type,
+                exc,
+            )
             return SendResult(success=False, error=str(exc))
 
     async def edit_message(
